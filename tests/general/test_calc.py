@@ -441,6 +441,46 @@ def test_accrued_interest_is_removed_from_cgt_and_reported_as_interest() -> None
     assert report.total_foreign_interest == Decimal("1.00")
 
 
+def test_stock_activity_missing_initial_price_falls_back_to_usd_close() -> None:
+    """Missing stock-award prices use USD close before GBP conversion."""
+    vest_date = datetime.date(2024, 5, 16)
+    currency_converter = CurrencyConverter(None, {vest_date: {"USD": Decimal(2)}})
+    price_fetcher = CurrentPriceFetcher(
+        currency_converter,
+        {},
+        {"META": {vest_date: Decimal(100)}},
+    )
+    calculator = CapitalGainsCalculator(
+        2024,
+        currency_converter,
+        IsinConverter(),
+        price_fetcher,
+        SpinOffHandler(),
+        InitialPrices(),
+        interest_fund_tickers=[],
+        balance_check=False,
+    )
+
+    calculator.convert_to_hmrc_transactions(
+        [
+            BrokerTransaction(
+                date=vest_date,
+                action=ActionType.STOCK_ACTIVITY,
+                symbol="META",
+                description="stock vest",
+                quantity=Decimal(2),
+                price=None,
+                fees=Decimal(0),
+                amount=None,
+                currency="USD",
+                broker="Test",
+            ),
+        ]
+    )
+
+    assert calculator.acquisition_list[vest_date]["META"].amount == Decimal(100)
+
+
 def test_proportional_disposal_no_rounding_error() -> None:
     """Test that disposing all shares doesn't cause rounding errors.
 

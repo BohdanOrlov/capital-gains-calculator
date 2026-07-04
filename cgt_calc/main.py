@@ -30,6 +30,7 @@ from .exceptions import (
     CalculatedAmountDiscrepancyError,
     CalculationError,
     CgtError,
+    ExchangeRateMissingError,
     InvalidTransactionError,
     PriceMissingError,
     QuantityMissingError,
@@ -252,8 +253,8 @@ class CapitalGainsCalculator:
             if price is None:
                 try:
                     price = self.initial_prices.get(transaction.date, symbol)
-                except KeyError:
-                    price = self.price_fetcher.get_closing_price(
+                except ExchangeRateMissingError:
+                    price = self.price_fetcher.get_closing_price_usd(
                         symbol, transaction.date
                     )
             amount = round_decimal(quantity * price, 2)

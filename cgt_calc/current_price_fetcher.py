@@ -41,8 +41,8 @@ class CurrentPriceFetcher:
             market_price_usd, "USD", datetime.datetime.now().date()
         )
 
-    def get_closing_price(self, symbol: str, date: datetime.date) -> Decimal:
-        """Get the price of the share on closing time."""
+    def get_closing_price_usd(self, symbol: str, date: datetime.date) -> Decimal:
+        """Get the USD price of the share at market close."""
         with suppress(KeyError):
             return self.historical_prices_data[symbol][date]
 
@@ -52,5 +52,9 @@ class CurrentPriceFetcher:
             end=(date + datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
         )
         closing_price = prices.iloc[0]["Close"]
-        market_price_usd = Decimal(format(closing_price, ".15g"))
+        return Decimal(format(closing_price, ".15g"))
+
+    def get_closing_price(self, symbol: str, date: datetime.date) -> Decimal:
+        """Get the GBP price of the share on closing time."""
+        market_price_usd = self.get_closing_price_usd(symbol, date)
         return self.converter.to_gbp(market_price_usd, "USD", date)

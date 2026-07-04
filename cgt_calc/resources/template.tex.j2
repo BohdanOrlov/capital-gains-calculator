@@ -163,9 +163,10 @@
         \BLOCK{ set is_interest = True }
         \BLOCK{ set interest_str = "UK" }
     \BLOCK{ elif symbol.startswith("interest") }
-        \BLOCK{ set symbol = symbol.split('$')[0][8:] }
+        \BLOCK{ set interest_parts = symbol.split('$') }
+        \BLOCK{ set interest_str = interest_parts[0][8:] }
+        \BLOCK{ set symbol = interest_parts[1] }
         \BLOCK{ set is_interest = True }
-        \BLOCK{ set interest_str = "Foreign" }
     \BLOCK{ elif symbol.startswith("excess-reported-income-distribution$") }
         \BLOCK{ set symbol = symbol[36:] }
         \BLOCK{ set is_eri_tax = True }

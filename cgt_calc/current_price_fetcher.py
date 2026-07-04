@@ -53,6 +53,4 @@ class CurrentPriceFetcher:
         )
         closing_price = prices.iloc[0]["Close"]
         market_price_usd = Decimal(format(closing_price, ".15g"))
-        return self.converter.to_gbp(
-            market_price_usd, "USD", datetime.datetime.now().date()
-        )
+        return self.converter.to_gbp(market_price_usd, "USD", date)

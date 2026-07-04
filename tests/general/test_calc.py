@@ -13,6 +13,7 @@ import pytest
 
 from cgt_calc.currency_converter import CurrencyConverter
 from cgt_calc.current_price_fetcher import CurrentPriceFetcher
+from cgt_calc.fixed_income import FixedIncomeType
 from cgt_calc.initial_prices import InitialPrices
 from cgt_calc.isin_converter import IsinConverter
 from cgt_calc.main import CapitalGainsCalculator
@@ -48,6 +49,29 @@ def get_report(
 def create_calculator(tax_year: int = 2024) -> CapitalGainsCalculator:
     """Create a calculator with standard test configuration."""
     currency_converter = CurrencyConverter(None, {})
+    price_fetcher = CurrentPriceFetcher(currency_converter, {}, {})
+    return CapitalGainsCalculator(
+        tax_year,
+        currency_converter,
+        IsinConverter(),
+        price_fetcher,
+        SpinOffHandler(),
+        InitialPrices(),
+        interest_fund_tickers=[],
+        balance_check=False,
+    )
+
+
+def create_calculator_with_usd_rates(
+    dates: list[datetime.date],
+    tax_year: int = 2024,
+    usd_rates: dict[datetime.date, Decimal] | None = None,
+) -> CapitalGainsCalculator:
+    """Create a calculator with deterministic USD rates for fixed-income tests."""
+    usd_rates = usd_rates or {}
+    currency_converter = CurrencyConverter(
+        None, {date: {"USD": usd_rates.get(date, Decimal(1))} for date in dates}
+    )
     price_fetcher = CurrentPriceFetcher(currency_converter, {}, {})
     return CapitalGainsCalculator(
         tax_year,
@@ -300,6 +324,121 @@ def test_bed_and_breakfast_zero_available_quantity_skip() -> None:
 
     second_match = datetime.date(2024, 3, 10)
     assert symbol not in calculator.bnb_list.get(second_match, {})
+
+
+def test_treasury_bill_discount_is_reported_as_interest_not_cgt() -> None:
+    """US Treasury bill discount is DDS-style income, not CGT."""
+    symbol = "912797GB7"
+    buy_date = datetime.date(2024, 3, 27)
+    sell_date = datetime.date(2024, 4, 15)
+
+    transactions = [
+        BrokerTransaction(
+            date=buy_date,
+            action=ActionType.TRANSFER,
+            symbol=None,
+            description="deposit",
+            quantity=None,
+            price=None,
+            fees=Decimal(0),
+            amount=Decimal(1000),
+            currency="USD",
+            broker="Test",
+        ),
+        BrokerTransaction(
+            date=buy_date,
+            action=ActionType.BUY,
+            symbol=symbol,
+            description="US TREASURY BILL24U S T BILL DUE 07/11/24",
+            quantity=Decimal(100),
+            price=Decimal("0.98"),
+            fees=Decimal(0),
+            amount=Decimal(-98),
+            currency="USD",
+            broker="Test",
+            fixed_income_type=FixedIncomeType.US_TREASURY_BILL.value,
+        ),
+        BrokerTransaction(
+            date=sell_date,
+            action=ActionType.SELL,
+            symbol=symbol,
+            description="US TREASURY BILL24U S T BILL DUE 07/11/24",
+            quantity=Decimal(100),
+            price=Decimal("1.00"),
+            fees=Decimal(0),
+            amount=Decimal(100),
+            currency="USD",
+            broker="Test",
+            fixed_income_type=FixedIncomeType.US_TREASURY_BILL.value,
+        ),
+    ]
+    calculator = create_calculator_with_usd_rates(
+        [transaction.date for transaction in transactions],
+        usd_rates={buy_date: Decimal(4), sell_date: Decimal(2)},
+    )
+
+    report = get_report(calculator, transactions)
+
+    assert report.disposal_count == 0
+    assert report.total_gain() == Decimal("0.00")
+    assert report.total_foreign_interest == Decimal("25.50")
+
+
+def test_accrued_interest_is_removed_from_cgt_and_reported_as_interest() -> None:
+    """Coupon-bond CGT uses clean price while accrued interest is income."""
+    symbol = "91282CDQ1"
+
+    transactions = [
+        BrokerTransaction(
+            date=datetime.date(2024, 5, 1),
+            action=ActionType.TRANSFER,
+            symbol=None,
+            description="deposit",
+            quantity=None,
+            price=None,
+            fees=Decimal(0),
+            amount=Decimal(1000),
+            currency="USD",
+            broker="Test",
+        ),
+        BrokerTransaction(
+            date=datetime.date(2024, 5, 1),
+            action=ActionType.BUY,
+            symbol=symbol,
+            description="US TREASUR NT 1.25%12/26UST NOTE DUE 12/31/26",
+            quantity=Decimal(100),
+            price=Decimal("1.00"),
+            fees=Decimal(0),
+            amount=Decimal(-102),
+            currency="USD",
+            broker="Test",
+            fixed_income_type=FixedIncomeType.US_TREASURY_NOTE.value,
+            accrued_interest=Decimal(2),
+        ),
+        BrokerTransaction(
+            date=datetime.date(2024, 6, 1),
+            action=ActionType.SELL,
+            symbol=symbol,
+            description="US TREASUR NT 1.25%12/26UST NOTE DUE 12/31/26",
+            quantity=Decimal(100),
+            price=Decimal("1.10"),
+            fees=Decimal(0),
+            amount=Decimal(113),
+            currency="USD",
+            broker="Test",
+            fixed_income_type=FixedIncomeType.US_TREASURY_NOTE.value,
+            accrued_interest=Decimal(3),
+        ),
+    ]
+    calculator = create_calculator_with_usd_rates(
+        [transaction.date for transaction in transactions]
+    )
+
+    report = get_report(calculator, transactions)
+
+    assert report.disposal_count == 1
+    assert report.total_gain() == Decimal("10.00")
+    assert report.total_foreign_interest == Decimal("1.00")
 
 
 def test_proportional_disposal_no_rounding_error() -> None:

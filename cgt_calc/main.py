@@ -36,6 +36,10 @@ from .exceptions import (
     QuantityNotPositiveError,
     SymbolMissingError,
 )
+from .fixed_income import (
+    is_coupon_bearing_fixed_income,
+    is_deeply_discounted_security_candidate,
+)
 from .initial_prices import InitialPrices
 from .isin_converter import IsinConverter
 from .model import (
@@ -76,6 +80,31 @@ def get_amount_or_fail(transaction: BrokerTransaction) -> Decimal:
     amount = transaction.amount
     if amount is None:
         raise AmountMissingError(transaction)
+    return amount
+
+
+def get_taxable_amount_or_fail(transaction: BrokerTransaction) -> Decimal:
+    """Return the amount to use for tax calculations.
+
+    Schwab fixed-income trades can be reported as dirty cash amounts that
+    include accrued interest. CGT uses clean principal consideration; accrued
+    interest is routed separately through income reporting.
+    """
+    amount = get_amount_or_fail(transaction)
+    accrued_interest = transaction.accrued_interest
+    if not accrued_interest:
+        return amount
+
+    if transaction.action in [ActionType.BUY, ActionType.REINVEST_SHARES]:
+        return amount + accrued_interest
+
+    if transaction.action in [
+        ActionType.SELL,
+        ActionType.CASH_MERGER,
+        ActionType.FULL_REDEMPTION,
+    ]:
+        return amount - accrued_interest
+
     return amount
 
 
@@ -188,6 +217,7 @@ class CapitalGainsCalculator:
         self.calculation_log_yields: CalculationLog = defaultdict(dict)
 
         self.portfolio: dict[str, Position] = defaultdict(Position)
+        self.fixed_income_portfolio: dict[str, Position] = defaultdict(Position)
         self.spin_offs: dict[datetime.date, list[SpinOff]] = defaultdict(list)
         self.eris: ExcessReportedIncomeLog = defaultdict(dict)
         self.eris_distribution: ExcessReportedIncomeDistributionLog = defaultdict(
@@ -220,7 +250,12 @@ class CapitalGainsCalculator:
         # Add to acquisition_list to apply same day rule
         if transaction.action is ActionType.STOCK_ACTIVITY:
             if price is None:
-                price = self.initial_prices.get(transaction.date, symbol)
+                try:
+                    price = self.initial_prices.get(transaction.date, symbol)
+                except KeyError:
+                    price = self.price_fetcher.get_closing_price(
+                        symbol, transaction.date
+                    )
             amount = round_decimal(quantity * price, 2)
         elif transaction.action is ActionType.SPIN_OFF:
             price, amount = self.handle_spin_off(transaction)
@@ -231,7 +266,7 @@ class CapitalGainsCalculator:
             if price is None:
                 raise PriceMissingError(transaction)
 
-            amount = get_amount_or_fail(transaction)
+            amount = get_taxable_amount_or_fail(transaction)
             calculated_amount = quantity * price + transaction.fees
             if not _approx_equal_price_rounding(
                 amount,
@@ -359,7 +394,7 @@ class CapitalGainsCalculator:
                 f"balance({self.portfolio[symbol].quantity})",
             )
 
-        amount = get_amount_or_fail(transaction)
+        amount = get_taxable_amount_or_fail(transaction)
         price = transaction.price
 
         self.portfolio[symbol] -= Position(quantity, amount)
@@ -385,6 +420,110 @@ class CapitalGainsCalculator:
             quantity,
             self.currency_converter.to_gbp_for(amount, transaction),
             self.currency_converter.to_gbp_for(transaction.fees, transaction),
+        )
+
+    def add_fixed_income_interest_adjustment(
+        self,
+        transaction: BrokerTransaction,
+        amount: Decimal,
+        label: str,
+    ) -> None:
+        """Add a fixed-income amount to the foreign-interest report stream."""
+        if not amount:
+            return
+
+        self.interest_list[
+            (label, transaction.currency, transaction.date)
+        ] += ForeignCurrencyAmount(amount, transaction.currency)
+
+    def add_accrued_interest_adjustment(
+        self,
+        transaction: BrokerTransaction,
+    ) -> None:
+        """Report accrued interest paid/received on coupon-bearing bonds."""
+        if not transaction.accrued_interest or not is_coupon_bearing_fixed_income(
+            transaction.fixed_income_type
+        ):
+            return
+
+        symbol = get_symbol_or_fail(transaction)
+        direction = (
+            Decimal(-1)
+            if transaction.action in [ActionType.BUY, ActionType.REINVEST_SHARES]
+            else Decimal(1)
+        )
+        self.add_fixed_income_interest_adjustment(
+            transaction,
+            direction * transaction.accrued_interest,
+            f"{transaction.broker} accrued interest {symbol}",
+        )
+
+    def add_deeply_discounted_security_acquisition(
+        self,
+        transaction: BrokerTransaction,
+    ) -> None:
+        """Track a DDS acquisition outside the CGT share-pooling engine."""
+        symbol = get_symbol_or_fail(transaction)
+        quantity = get_quantity_or_fail(transaction)
+        if quantity <= 0:
+            raise QuantityNotPositiveError(transaction)
+
+        amount = -get_taxable_amount_or_fail(transaction)
+        self.fixed_income_portfolio[symbol] += Position(
+            quantity,
+            self.currency_converter.to_gbp_for(amount, transaction),
+        )
+
+    def add_deeply_discounted_security_disposal(
+        self,
+        transaction: BrokerTransaction,
+    ) -> None:
+        """Report DDS disposal/redemption profit as foreign interest."""
+        symbol = get_symbol_or_fail(transaction)
+        quantity = get_quantity_or_fail(transaction)
+        if quantity <= 0:
+            raise QuantityNotPositiveError(transaction)
+
+        position = self.fixed_income_portfolio[symbol]
+        if quantity > position.quantity:
+            raise InvalidTransactionError(
+                transaction,
+                f"Disposing {quantity} exceeds DDS holding of {position.quantity}",
+            )
+
+        proceeds = self.currency_converter.to_gbp_for(
+            get_taxable_amount_or_fail(transaction),
+            transaction,
+        )
+        cost = normalize_amount((quantity * position.amount) / position.quantity)
+        income = proceeds - cost
+        self.fixed_income_portfolio[symbol] = Position(
+            position.quantity - quantity,
+            normalize_amount(position.amount - cost),
+        )
+        if self.fixed_income_portfolio[symbol].quantity == 0:
+            del self.fixed_income_portfolio[symbol]
+
+        if transaction.currency == UK_CURRENCY:
+            interest_amount = income
+        else:
+            # process_interests expects source-currency amounts. DDS profit is
+            # measured in GBP because acquisition and disposal can have
+            # different FX rates, so store the source-currency equivalent.
+            interest_amount = income * self.currency_converter.currency_to_gbp_rate(
+                transaction.currency, transaction.date
+            )
+        self.add_fixed_income_interest_adjustment(
+            transaction,
+            interest_amount,
+            f"{transaction.broker} deeply discounted security {symbol}",
+        )
+        LOGGER.debug(
+            "DDS %s disposal: proceeds £%s, cost £%s, income £%s",
+            symbol,
+            proceeds,
+            cost,
+            income,
         )
 
     def add_eri(
@@ -516,7 +655,13 @@ class CapitalGainsCalculator:
                 ActionType.REINVEST_SHARES,
             ]:
                 new_balance += get_amount_or_fail(transaction)
-                self.add_acquisition(transaction)
+                if is_deeply_discounted_security_candidate(
+                    transaction.fixed_income_type
+                ):
+                    self.add_deeply_discounted_security_acquisition(transaction)
+                else:
+                    self.add_acquisition(transaction)
+                    self.add_accrued_interest_adjustment(transaction)
             elif transaction.action in [
                 ActionType.SELL,
                 ActionType.CASH_MERGER,
@@ -524,11 +669,18 @@ class CapitalGainsCalculator:
             ]:
                 amount = get_amount_or_fail(transaction)
                 new_balance += amount
-                self.add_disposal(transaction)
-                if self.date_in_tax_year(transaction.date):
-                    total_disposal_proceeds += self.currency_converter.to_gbp_for(
-                        amount + transaction.fees, transaction
-                    )
+                if is_deeply_discounted_security_candidate(
+                    transaction.fixed_income_type
+                ):
+                    self.add_deeply_discounted_security_disposal(transaction)
+                else:
+                    self.add_disposal(transaction)
+                    self.add_accrued_interest_adjustment(transaction)
+                    if self.date_in_tax_year(transaction.date):
+                        total_disposal_proceeds += self.currency_converter.to_gbp_for(
+                            get_taxable_amount_or_fail(transaction) + transaction.fees,
+                            transaction,
+                        )
             elif transaction.action is ActionType.FEE:
                 amount = get_amount_or_fail(transaction)
                 new_balance += amount

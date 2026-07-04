@@ -44,6 +44,24 @@ class TestBondPricing:
         assert len(transactions) == 1
         assert transactions[0].price == Decimal("100.7695")
 
+    def test_bond_sell_accrued_interest_is_split(self, tmp_path: Path) -> None:
+        """Test accrued interest is preserved separately from fees."""
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            "Date,Action,Symbol,Description,Price,Quantity,Fees & Comm,Amount\n"
+            "06/25/2026,Sell,91282CDQ1,"
+            "US TREASUR NT 1.25%12/26UST NOTE DUE 12/31/26,"
+            "$98.6406,58000,$0.00,$57566.05\n"
+        )
+
+        transactions = SchwabParser().load_from_file(csv_file)
+
+        assert len(transactions) == 1
+        assert transactions[0].price == Decimal("0.986406")
+        assert transactions[0].fees == Decimal("0.00")
+        assert transactions[0].accrued_interest == Decimal("354.502000")
+        assert transactions[0].fixed_income_type == "US_TREASURY_NOTE"
+
     def test_regular_stock_price_not_divided(self, tmp_path: Path) -> None:
         """Test that regular stock price is not divided by 100."""
         csv_file = tmp_path / "transactions.csv"

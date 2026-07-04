@@ -179,6 +179,8 @@ class BrokerTransaction:
     currency: str
     broker: str
     isin: str | None = None
+    fixed_income_type: str | None = None
+    accrued_interest: Decimal = Decimal(0)
 
     def __post_init__(self) -> None:
         """Validate BrokerTransaction data."""

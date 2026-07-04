@@ -20,8 +20,9 @@ from cgt_calc.exceptions import (
     UnexpectedColumnCountError,
     UnexpectedRowCountError,
 )
+from cgt_calc.fixed_income import classify_fixed_income
 from cgt_calc.model import ActionType, BrokerTransaction
-from cgt_calc.parsers.schwab_cusip_bonds import adjust_cusip_bond_price
+from cgt_calc.parsers.schwab_cusip_bonds import calculate_cusip_bond_adjustment
 
 from .base_parsers import BaseSingleFileParser
 
@@ -156,7 +157,12 @@ def action_from_str(label: str, file: Path) -> ActionType:
     if label in ["Cash Merger", "Cash Merger Adj"]:
         return ActionType.CASH_MERGER
 
-    if label in ["Full Redemption", "Full Redemption Adj"]:
+    if label in [
+        "Full Redemption",
+        "Full Redemption Adj",
+        "CXL Redemption Adj",
+        "Redemption Adj",
+    ]:
         return ActionType.FULL_REDEMPTION
 
     raise ParsingError(file, f"Unknown action: '{label}'")
@@ -214,19 +220,24 @@ class SchwabTransaction(BrokerTransaction):
         )
         fees_header = SchwabTransactionsFileRequiredHeaders.FEES_AND_COMM.value
         fees = (
-            Decimal(row_dict[fees_header].replace("$", ""))
+            Decimal(row_dict[fees_header].replace("$", "").replace(",", ""))
             if row_dict[fees_header] != ""
             else Decimal(0)
         )
         amount_header = SchwabTransactionsFileRequiredHeaders.AMOUNT.value
         amount = (
-            Decimal(row_dict[amount_header].replace("$", ""))
+            Decimal(row_dict[amount_header].replace("$", "").replace(",", ""))
             if row_dict[amount_header] != ""
             else None
         )
+        fixed_income_type = classify_fixed_income(symbol, description)
 
         # Handle bonds/notes: CUSIP symbols have price per $100 face value
-        price, fees = adjust_cusip_bond_price(symbol, price, quantity, amount, fees)
+        adjustment = calculate_cusip_bond_adjustment(
+            symbol, price, quantity, amount, fees
+        )
+        price = adjustment.price
+        fees = adjustment.fees
 
         currency = "USD"
         broker = "Charles Schwab"
@@ -241,6 +252,10 @@ class SchwabTransaction(BrokerTransaction):
             amount,
             currency,
             broker,
+            fixed_income_type=(
+                fixed_income_type.value if fixed_income_type is not None else None
+            ),
+            accrued_interest=adjustment.accrued_interest,
         )
 
     @staticmethod
@@ -260,7 +275,17 @@ class SchwabTransaction(BrokerTransaction):
             # for awards which don't match the PDF statements.
             # We want to make sure to match date and price form the awards
             # spreadsheet.
-            _vest_date, transaction.price = awards_prices.get(transaction.date, symbol)
+            try:
+                _vest_date, transaction.price = awards_prices.get(
+                    transaction.date, symbol
+                )
+            except KeyError:
+                LOGGER.warning(
+                    "Schwab award price is missing for %s on %s; "
+                    "falling back to calculator price sources",
+                    symbol,
+                    transaction.date,
+                )
         return transaction
 
 
@@ -389,6 +414,11 @@ def _unify_schwab_paired_transactions(
         Row 1: "Full Redemption Adj" - Has Quantity (-100 shares), No Amount
         Row 2: "Full Redemption" - Has Amount ($1000), No Quantity/Price
         Result: Sell 100 shares at $10/share
+
+    Called redemption pattern:
+        Row 1: "CXL Redemption Adj" - Has Amount (proceeds), No Price/Quantity
+        Row 2: "Redemption Adj" - Has Quantity (-100 shares), No Amount
+        Result: Full redemption disposal at the call price
     """
     filtered: list[SchwabTransaction] = []
     i = 0
@@ -421,17 +451,23 @@ def _unify_schwab_paired_transactions(
                 unified,
             )
 
-        elif transaction.raw_action == "Full Redemption Adj":
-            # Full Redemption Adj comes BEFORE Full Redemption
+        elif transaction.raw_action in ["Full Redemption Adj", "CXL Redemption Adj"]:
+            # Redemption amount row comes BEFORE the quantity row.
             assert i + 1 < len(transactions), (
-                "Full Redemption Adj must be followed by a Full Redemption transaction"
+                f"{transaction.raw_action} must be followed by a redemption transaction"
             )
             adj_transaction = transaction
             main_transaction = transactions[i + 1]
 
-            # Validate it's a Full Redemption pair
-            assert main_transaction.raw_action == "Full Redemption", (
-                "Full Redemption Adj must be followed by Full Redemption"
+            # Validate it's a redemption pair
+            expected_main_actions = (
+                ["Full Redemption"]
+                if transaction.raw_action == "Full Redemption Adj"
+                else ["Redemption Adj"]
+            )
+            assert main_transaction.raw_action in expected_main_actions, (
+                f"{transaction.raw_action} must be followed by "
+                f"{' or '.join(expected_main_actions)}"
             )
 
             unified = _combine_full_redemption_pair(

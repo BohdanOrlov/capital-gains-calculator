@@ -61,6 +61,30 @@ class TestCorporateActionPairing:
         assert unified.price == Decimal(50)  # 2500 / 50
         assert unified.fees == Decimal(0)  # No fees
 
+    def test_called_redemption_pairing(self, tmp_path: Path) -> None:
+        """Test CXL Redemption Adj + Redemption Adj are correctly combined."""
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            "Date,Action,Symbol,Description,Price,Quantity,Fees & Comm,Amount\n"
+            "05/18/2026,CXL Redemption Adj,21036PAQ1,"
+            "CONSTELLATION BRA 3.7%26**CALLED** @100 EFF: 05/18/2026"
+            ",,,,$5000.00\n"
+            "05/18/2026,Redemption Adj,21036PAQ1,"
+            "CONSTELLATION BRA 3.7%26**CALLED** @100 EFF: 05/18/2026"
+            ",,-5000,,\n"
+        )
+
+        transactions = SchwabParser().load_from_file(csv_file)
+
+        assert len(transactions) == 1
+        unified = transactions[0]
+        assert unified.action == ActionType.FULL_REDEMPTION
+        assert unified.symbol == "21036PAQ1"
+        assert unified.quantity == Decimal(5000)
+        assert unified.amount == Decimal("5000.00")
+        assert unified.price == Decimal("1.00")
+        assert unified.fixed_income_type == "CORPORATE_BOND"
+
     def test_cash_merger_with_other_transactions(self, tmp_path: Path) -> None:
         """Test Cash Merger pairing doesn't affect other transactions."""
         csv_file = tmp_path / "transactions.csv"

@@ -6,6 +6,7 @@ need prices per $1 face value. This module handles the conversion and validation
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 import logging
 from typing import Final
@@ -22,6 +23,15 @@ BOND_PRICE_TOLERANCE_RATIO: Final = Decimal("0.5")
 
 # Valid CUSIP characters for positions 7-8 (letters + special chars for fixed income)
 CUSIP_ALPHA_CHARS: Final = "ABCDEFGHIJKLMNOPQRSTUVWXYZ*@#"
+
+
+@dataclass(frozen=True)
+class CusipBondAdjustment:
+    """Normalized CUSIP bond pricing fields."""
+
+    price: Decimal | None
+    fees: Decimal
+    accrued_interest: Decimal
 
 
 def _validate_cusip_check_digit(cusip: str) -> bool:
@@ -158,9 +168,30 @@ def adjust_cusip_bond_price(
         (Decimal("99.1727"), Decimal("0"))
 
     """
+    adjustment = calculate_cusip_bond_adjustment(
+        symbol, price, quantity, amount, fees
+    )
+    if adjustment.accrued_interest > MIN_ACCRUED_INTEREST_THRESHOLD:
+        return (adjustment.price, adjustment.fees + adjustment.accrued_interest)
+    return (adjustment.price, adjustment.fees)
+
+
+def calculate_cusip_bond_adjustment(
+    symbol: str | None,
+    price: Decimal | None,
+    quantity: Decimal | None,
+    amount: Decimal | None,
+    fees: Decimal,
+) -> CusipBondAdjustment:
+    """Normalize CUSIP bond price and split accrued interest from fees.
+
+    The legacy :func:`adjust_cusip_bond_price` folds accrued interest into fees
+    for backward compatibility. New calculator paths need the split values so
+    clean principal consideration can stay separate from taxable interest.
+    """
     # Early return if not a CUSIP or missing price
     if not _is_cusip_symbol(symbol) or price is None:
-        return (price, fees)
+        return CusipBondAdjustment(price, fees, Decimal(0))
 
     # Mypy: at this point price is guaranteed to be non-None due to check above
     assert price is not None
@@ -169,7 +200,7 @@ def adjust_cusip_bond_price(
     # If we can't validate, apply adjustment anyway (trusted data)
     if quantity is None or amount is None:
         LOGGER.debug("Bond %s: applied /100 price adjustment (no validation)", symbol)
-        return (adjusted_price, fees)
+        return CusipBondAdjustment(adjusted_price, fees, Decimal(0))
 
     # Validate the amount matches expected calculation
     expected_gross = quantity * adjusted_price
@@ -182,17 +213,18 @@ def adjust_cusip_bond_price(
             float(expected_gross - fees if amount < 0 else expected_gross + fees),
             float(amount),
         )
-        return (price, fees)
+        return CusipBondAdjustment(price, fees, Decimal(0))
 
     # Validation passed - calculate accrued interest
     expected_amount = quantity * adjusted_price
     accrued_interest = abs(amount) - abs(expected_amount) - abs(fees)
 
     if accrued_interest > MIN_ACCRUED_INTEREST_THRESHOLD:
-        adjusted_fees = fees + accrued_interest
         LOGGER.debug(
-            "Bond %s: added accrued interest $%s to fees", symbol, accrued_interest
+            "Bond %s: split accrued interest $%s from cash amount",
+            symbol,
+            accrued_interest,
         )
-        return (adjusted_price, adjusted_fees)
+        return CusipBondAdjustment(adjusted_price, fees, accrued_interest)
 
-    return (adjusted_price, fees)
+    return CusipBondAdjustment(adjusted_price, fees, Decimal(0))
